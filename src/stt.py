@@ -39,6 +39,38 @@ def get_audio_duration(filepath):
         return None
     
 from pydub import AudioSegment, silence
+import threading
+import sys
+import time
+
+class Spinner:
+    def __init__(self, message="진행 중"):
+        self.message = message
+        self.stop_animation = threading.Event()
+        self.anim_thread = None
+
+    def animate(self):
+        dots = 0
+        while not self.stop_animation.is_set():
+            sys.stdout.write(f"\r{self.message}{'.' * dots}{' ' * (3-dots)}")
+            sys.stdout.flush()
+            dots = (dots + 1) % 4
+            time.sleep(0.4)
+
+    def start(self):
+        self.anim_thread = threading.Thread(target=self.animate)
+        self.anim_thread.daemon = True
+        self.anim_thread.start()
+
+    def stop(self, done_message=None):
+        self.stop_animation.set()
+        if self.anim_thread:
+            self.anim_thread.join()
+        if done_message:
+            sys.stdout.write(f"\r{done_message}                \n")
+        else:
+            sys.stdout.write(f"\r{self.message} 완료!                \n")
+        sys.stdout.flush()
 
 def trim_trailing_silence(input_path, output_path, silence_thresh=-40, min_silence_len=1000):
     """
@@ -69,7 +101,6 @@ from transformers import AutoProcessor, pipeline
 import os
 import torch
 import glob
-import time
 
 # transformers 경고/안내 메시지 숨기기
 import logging; logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -82,20 +113,20 @@ MODEL_ID = "openai/whisper-large-v3-turbo"
 
 def main():
     # 1. 현재 폴더에서 audio/video 파일 모두 찾기
-    print("현재 디렉토리에서 오디오/비디오 파일을 찾는 중입니다...")
+    find_spinner = Spinner("현재 디렉토리에서 오디오/비디오 파일을 찾는 중")
+    find_spinner.start()
     target_extensions = ["*.mp3", "*.mp4", "*.wav", "*.m4a"]
     files_dir = "files"
     results_dir = "results"
     files = []
     
     if not os.path.exists(files_dir):
-        print(f"'{files_dir}' 디렉토리가 없습니다. 생성 중...")
+        find_spinner.stop(f"'{files_dir}' 디렉토리가 없습니다. 생성 중...")
         os.makedirs(files_dir)
         print(f"'{files_dir}' 디렉토리에 오디오/비디오 파일을 넣어주세요.")
         return
 
     if not os.path.exists(results_dir):
-        print(f"'{results_dir}' 생성 중...")
         os.makedirs(results_dir)
 
     for ext in target_extensions:
@@ -107,17 +138,18 @@ def main():
     files = sorted(list(set(files)))
 
     if not files:
-        print("현재 디렉토리에 오디오/비디오 파일이 없습니다.")
+        find_spinner.stop("현재 디렉토리에 오디오/비디오 파일이 없습니다.")
         return
 
-    print(f"     발견된 파일: {len(files)}개")
+    find_spinner.stop(f"현재 디렉토리에서 오디오/비디오 파일 찾기 완료! (총 {len(files)}개)")
     for f in files:
         print(f"   - {f}")
     print("\n" + "="*50)
 
 
     # 2. 모델 로드 (GPU → NPU → CPU 순서로 자동 fallback)
-    print(f"[모델 로딩] Intel GPU → NPU → CPU 순서로 시도 중...")
+    model_spinner = Spinner("[모델 로딩] Intel GPU → NPU → CPU 순서로 시도 중")
+    model_spinner.start()
     device_priority = ["GPU", "NPU", "CPU"]
     model = None
     last_error = None
@@ -125,11 +157,9 @@ def main():
     model_loaded = False
     for device in device_priority:
         try:
-            print(f"  시도 중인 장치: {device}")
             # OpenVINO 변환 모델이 있으면 바로 로드, 없으면 변환 후 저장
             if os.path.exists(openvino_dir):
                 model = OVModelForSpeechSeq2Seq.from_pretrained(openvino_dir, device_map=device)
-                print(f"  {openvino_dir}에서 OpenVINO 모델 로드됨")
             else:
                 model = OVModelForSpeechSeq2Seq.from_pretrained(
                     MODEL_ID,
@@ -139,7 +169,6 @@ def main():
                     load_in_8bit=True,
                 )
                 model.save_pretrained(openvino_dir)
-                print(f"  OpenVINO 모델 변환 및 저장됨: {openvino_dir}")
             processor = AutoProcessor.from_pretrained(MODEL_ID)
             pipe = pipeline(
                 "automatic-speech-recognition",
@@ -152,15 +181,14 @@ def main():
                 ignore_warning=True,
                 use_fast=True,
             )
-            print(f"  성공: 모델이 {device}에 로드되었습니다")
             model_loaded = True
+            model_spinner.stop(f"[모델 로딩] 성공: 모델이 {device}에 로드되었습니다")
             break
         except Exception as e:
-            print(f"  {device}에서 실패: {e}")
             last_error = e
             model = None
     if not model_loaded:
-        print(f"\n모든 장치에서 모델 로드 실패: {last_error}")
+        model_spinner.stop(f"\n모든 장치에서 모델 로드 실패: {last_error}")
         return
 
     print("모델 로드 완료. 변환을 시작합니다.")
@@ -222,28 +250,36 @@ def main():
                 "ffmpeg", "-y", "-i", input_for_pipe,
                 "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", temp_wav
             ]
-            print(f"     [Step 1] 비디오를 wav로 추출 중...")
+            extract_spinner = Spinner(f"     [Step 1] 비디오를 wav로 추출 중")
+            extract_spinner.start()
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if not os.path.exists(temp_wav):
-                    print(f"     [Error] ffmpeg 실패: {result.stderr}")
+                    extract_spinner.stop(f"     [Error] ffmpeg 실패: {result.stderr}")
                     raise RuntimeError(f"ffmpeg failed: {result.stderr}")
-                print(f"     [Step 1] 오디오 추출됨: {temp_wav}")
+                extract_spinner.stop(f"     [Step 1] 오디오 추출됨: {temp_wav}")
                 input_for_pipe = temp_wav
             except Exception as e:
-                print(f"     [Error] {filename}에서 오디오 추출 실패: {e}\n")
+                extract_spinner.stop(f"     [Error] {filename}에서 오디오 추출 실패: {e}\n")
                 continue
 
-        print(f"     [Step 2] 음성 텍스트 변환 실행 중...")
         try:
             # prompt_text를 token ids로 변환 로직 제거됨
             
             generate_kwargs = {
                 "language": "korean",
             }
-            result = pipe(input_for_pipe, generate_kwargs=generate_kwargs)
-            print(f"     [Step 2] 변환 완료.")
-            print(f"     [Step 3] 결과를 {output_filename}에 저장 중 ...")
+
+            stt_spinner = Spinner("     [Step 2] 음성 텍스트 변환 실행 중")
+            stt_spinner.start()
+
+            try:
+                result = pipe(input_for_pipe, generate_kwargs=generate_kwargs)
+            finally:
+                stt_spinner.stop("     [Step 2] 음성 텍스트 변환 완료!")
+
+            save_spinner = Spinner(f"     [Step 3] 결과를 {output_filename}에 저장 중")
+            save_spinner.start()
 
             # 특정 query가 포함된 문장 모두 제거
             # 제거할 문구 파일에서 불러오기
@@ -271,6 +307,9 @@ def main():
             filtered_text = '. '.join(sentences).strip()
             with open(output_filename, "w", encoding="utf-8") as f:
                 f.write(filtered_text)
+
+            save_spinner.stop(f"     [Step 3] 결과를 {output_filename}에 저장 완료!")
+
             end_time = time.time()
             duration = end_time - start_time
 
